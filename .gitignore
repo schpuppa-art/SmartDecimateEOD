@@ -1,0 +1,17 @@
+# Build artifacts
+*.dll
+*.obj
+*.exp
+*.lib
+*.pdb
+
+# Plugin runtime output
+*.sdec.bin
+*.sdec.log
+sdec_*.csv
+*.scenes.txt
+
+# Editor / OS
+*.bak
+Thumbs.db
+.DS_Store
