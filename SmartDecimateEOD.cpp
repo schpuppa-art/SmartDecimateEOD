@@ -18,14 +18,18 @@
 //      to preserve all originals in on-ones scenes, at fixed total length
 //
 //  Pipeline ordering (recommended):
-//      src → SCDetectEOD(cache=...) → SmartDecimateEOD(sc_clip, cache=...) → RIFE
+//      src → SmartDecimateEOD(scenes_file=..., cache=...) → RIFE
+//      (or legacy: src → SCDetectEOD(...) → SmartDecimateEOD(sc=..., cache=...))
+//
+//  Boundary source (scenes_file wins if both given):
+//    scenes_file — direct read of SCDetectEOD's scenes.txt, no sc clip needed.
+//                  meanY is computed per-frame from thumbnails in Pass 1A, so
+//                  fade detection works.
+//    sc clip     — boundaries + _scd_meanY via frame-props (legacy).
 //
 //  Two-pass eager preanalysis in constructor (stateless, AvsPmod-safe):
-//    PASS 1A — per-frame SAD diff on downscaled Y; read _scd_boundary from
-//              sc_clip to split into scenes; read _scd_meanY if available
-//              (SCDetectEOD v1 ANALYZE mode or v2 ANALYZE mode) for fade detection.
-//              In v2 READ mode _scd_meanY is absent — fade detection auto-disabled.
-//    PASS 1B — per-scene Otsu threshold on diffs → classify ORIG/DUP;
+//    PASS 1 — single decode per scene: SSIM thumbnail + downscaled
+//              registration buffer in one sweep; classify ORIG/DUP per scene;
 //              unimodal-variance guard forces all-ORIG on full on-ones scenes;
 //              monotonic meanY drift forces all-ORIG on fades
 //    PASS 2  — global budget: keep all ORIG, fill remaining budget with the
@@ -53,8 +57,20 @@
 #include <vector>
 #include "avisynth.h"
 
+// Cyrillic/UTF-8 safe fopen: AviSynth passes paths as UTF-8; CRT fopen on
+// ru-Windows interprets them as cp1251 and fails on Cyrillic. Convert to
+// wide and use _wfopen.
+static FILE* fopen_utf8(const char* path, const wchar_t* mode) {
+    if (!path || !*path) return nullptr;
+    int wl = MultiByteToWideChar(CP_UTF8, 0, path, -1, nullptr, 0);
+    if (wl <= 0) return nullptr;
+    std::vector<wchar_t> wpath(wl);
+    MultiByteToWideChar(CP_UTF8, 0, path, -1, wpath.data(), wl);
+    return _wfopen(wpath.data(), mode);
+}
+
 static const uint32_t SDEC_MAGIC   = 0x43454453; // 'SDEC' little-endian
-static const uint32_t SDEC_VERSION = 2;         // v2: includes diagnostic arrays
+static const uint32_t SDEC_VERSION = 3;         // v3: + out_boundary (decimated scene cuts)
 
 static uint64_t fnv1a(const void* data, size_t len, uint64_t seed = 0xcbf29ce484222325ULL) {
     const uint8_t* p = (const uint8_t*)data;
@@ -101,6 +117,8 @@ class SmartDecimateEOD : public GenericVideoFilter {
     std::string cache_path;
     std::string log_path;
     std::string analyze_log_path;
+    std::string scuts_out_path;
+    std::string scenes_file_path;   // direct boundary source; wins over sc_clip
 
     // Diagnostic arrays
     std::vector<int>     d_ssim;         // size N  SSIM×1000 (thumbnail)
@@ -118,6 +136,7 @@ class SmartDecimateEOD : public GenericVideoFilter {
     // Preanalysis output
     std::vector<uint8_t> keep_mask;    // size N  (1 = kept)
     std::vector<int32_t> out_to_src;   // size T  (source index per output frame)
+    std::vector<uint8_t> out_boundary; // size T  (1 = scene boundary on decimated timeline)
     std::vector<int32_t> scene_of;     // size N  (scene id per source frame, debug)
     std::vector<uint8_t> is_dup;       // size N  (debug)
     std::vector<uint8_t> is_fade_src;  // size N  (debug, per-frame copy of scene flag)
@@ -213,6 +232,16 @@ class SmartDecimateEOD : public GenericVideoFilter {
         }
     }
 
+    // Mean luma of a built thumbnail (full-range Y, 0..255). Matches the scale
+    // of SCDetectEOD's _scd_meanY, so fade drift uses the same numbers whether
+    // meanY came from sc_clip props or was computed here in scenes_file mode.
+    static int thumb_mean(const uint8_t* thumb, int n) {
+        if (n <= 0) return 0;
+        long acc = 0;
+        for (int i = 0; i < n; ++i) acc += thumb[i];
+        return (int)(acc / n);
+    }
+
     static int compute_ssim(const uint8_t* a, const uint8_t* b, int n) {
         double sum_a = 0, sum_b = 0, sum_a2 = 0, sum_b2 = 0, sum_ab = 0;
         for (int i = 0; i < n; i++) {
@@ -235,46 +264,80 @@ class SmartDecimateEOD : public GenericVideoFilter {
     }
 
     // ─── Registration + SAD + block ratio (from v3.5) ──────────────────
-    static double sad_shifted(const uint8_t* p0, int pitch0,
-                              const uint8_t* p1, int pitch1,
-                              int W, int H, int s, int dx, int dy) {
-        int Wd = W / s, Hd = H / s;
+    // Operates on a pre-downscaled DENSE Y buffer (W_s × H_s) instead of the
+    // full-res frame. The downscale (box-average by reg_scale) is done once
+    // per frame; the 49-pass grid search then runs on the small contiguous
+    // buffer — cache-friendly and reg_scale^2 fewer pixels. On 4K this is the
+    // dominant cost, so it makes Pass 1 fast.
+    int rs_w() const { int rs = reg_scale < 1 ? 1 : reg_scale; return vi.width / rs; }
+    int rs_h() const { int rs = reg_scale < 1 ? 1 : reg_scale; return vi.height / rs; }
+
+    void downscale_into(PVideoFrame& f, uint8_t* out) {
+        const uint8_t* yp = f->GetReadPtr(PLANAR_Y);
+        int pitch = f->GetPitch(PLANAR_Y);
+        int W = vi.width, H = vi.height;
+        int rs = reg_scale < 1 ? 1 : reg_scale;
+        int ow = W / rs, oh = H / rs;
+        if (rs == 1) {
+            for (int y = 0; y < oh; ++y)
+                std::memcpy(out + (size_t)y * ow, yp + (size_t)y * pitch, ow);
+            return;
+        }
+        for (int y = 0; y < oh; ++y) {
+            for (int x = 0; x < ow; ++x) {
+                int acc = 0;
+                for (int dy = 0; dy < rs; ++dy) {
+                    const uint8_t* row = yp + (size_t)(y * rs + dy) * pitch + x * rs;
+                    for (int dx = 0; dx < rs; ++dx) acc += row[dx];
+                }
+                out[(size_t)y * ow + x] = (uint8_t)(acc / (rs * rs));
+            }
+        }
+    }
+
+    void downscale_y(PVideoFrame& f, std::vector<uint8_t>& out) {
+        out.resize((size_t)rs_w() * rs_h());
+        downscale_into(f, out.data());
+    }
+
+    static double sad_buf(const uint8_t* p0, const uint8_t* p1,
+                          int W, int H, int dx, int dy, int stride = 1) {
         int margin = 4;
         int64_t sad = 0, cnt = 0;
-        for (int yd = margin; yd < Hd - margin; ++yd) {
-            int y0 = yd * s, y1 = y0 + dy;
+        for (int y = margin; y < H - margin; y += stride) {
+            int y1 = y + dy;
             if (y1 < 0 || y1 >= H) continue;
-            const uint8_t* r0 = p0 + y0 * pitch0;
-            const uint8_t* r1 = p1 + y1 * pitch1;
-            for (int xd = margin; xd < Wd - margin; ++xd) {
-                int x0 = xd * s, x1 = x0 + dx;
+            const uint8_t* r0 = p0 + (size_t)y * W;
+            const uint8_t* r1 = p1 + (size_t)y1 * W;
+            for (int x = margin; x < W - margin; x += stride) {
+                int x1 = x + dx;
                 if (x1 < 0 || x1 >= W) continue;
-                sad += std::abs((int)r0[x0] - (int)r1[x1]);
+                sad += std::abs((int)r0[x] - (int)r1[x1]);
                 cnt++;
             }
         }
         return cnt ? (double)sad / (double)cnt : 0.0;
     }
 
-    void compute_pair(PVideoFrame& prev, PVideoFrame& cur,
-                      double& residual, double& ratio) {
-        const uint8_t* p0 = prev->GetReadPtr(PLANAR_Y);
-        const uint8_t* p1 = cur->GetReadPtr(PLANAR_Y);
-        int pitch0 = prev->GetPitch(PLANAR_Y);
-        int pitch1 = cur->GetPitch(PLANAR_Y);
-        int W = vi.width, H = vi.height;
-        int rs = reg_scale < 1 ? 1 : reg_scale;
-        // Grid search ±3 at scale=4*rs
+    // prev_buf and cur_buf are pre-downscaled dense Y buffers (rs_w × rs_h).
+    void compute_pair_buf(const uint8_t* p0, const uint8_t* p1,
+                          double& residual, double& ratio) {
+        int W = rs_w(), H = rs_h();
+        // Coarse grid search ±3 on a strided subsample (every 4th pixel) —
+        // finding the shift doesn't need every pixel. Final residual at the
+        // chosen shift is computed densely.
+        int gstride = 4;
         int best_dx = 0, best_dy = 0; double best = 1e30;
         for (int dy = -3; dy <= 3; ++dy)
             for (int dx = -3; dx <= 3; ++dx) {
-                double s = sad_shifted(p0, pitch0, p1, pitch1, W, H, 4 * rs, dx, dy);
+                double s = sad_buf(p0, p1, W, H, dx, dy, gstride);
                 if (s < best) { best = s; best_dx = dx; best_dy = dy; }
             }
-        residual = sad_shifted(p0, pitch0, p1, pitch1, W, H, rs, best_dx, best_dy);
-        // Block ratio at reg_scale
-        int BS = 16 * rs;
+        residual = sad_buf(p0, p1, W, H, best_dx, best_dy, 2);
+        // Block ratio
+        int BS = 16;
         int nbx = (W - 8) / BS, nby = (H - 8) / BS;
+        if (nbx < 1 || nby < 1) { ratio = 1.0; return; }
         std::vector<double> blocks;
         blocks.reserve((size_t)nbx * nby);
         for (int by = 0; by < nby; ++by)
@@ -284,8 +347,8 @@ class SmartDecimateEOD : public GenericVideoFilter {
                 for (int j = 0; j < BS; ++j) {
                     int y1 = y0 + j + best_dy;
                     if (y1 < 0 || y1 >= H) continue;
-                    const uint8_t* r0 = p0 + (y0 + j) * pitch0;
-                    const uint8_t* r1 = p1 + y1 * pitch1;
+                    const uint8_t* r0 = p0 + (size_t)(y0 + j) * W;
+                    const uint8_t* r1 = p1 + (size_t)y1 * W;
                     for (int i = 0; i < BS; ++i) {
                         int x1 = x0 + i + best_dx;
                         if (x1 < 0 || x1 >= W) continue;
@@ -302,6 +365,24 @@ class SmartDecimateEOD : public GenericVideoFilter {
         ratio = mn > 0.01 ? mx / mn : 1.0;
     }
 
+    // Deterministic params hash: serialize each field into a packed buffer
+    // (no struct padding) so identical settings always hash identically.
+    uint64_t params_hash_for(int mode_id) const {
+        uint8_t buf[128];
+        size_t o = 0;
+        auto putd = [&](double v){ std::memcpy(buf+o,&v,sizeof(v)); o+=sizeof(v); };
+        auto puti = [&](int v){ std::memcpy(buf+o,&v,sizeof(v)); o+=sizeof(v); };
+        auto putb = [&](uint8_t v){ buf[o++]=v; };
+        putd(fps_out); putd(bypass_alt); putd(residual_ceiling);
+        putd(residual_mult); putd(th_ratio);
+        puti(th_ssim_dup); puti((int)full_range); puti(mode_id);
+        puti(fade_ratio); puti(fade_mean_drift);
+        puti(thumb_w); puti(thumb_h); puti(reg_scale);
+        putb((uint8_t)bypass_min_len); putb((uint8_t)bypass_window);
+        putb((uint8_t)(protect_fade?1:0)); putb((uint8_t)(allow_original_cut?1:0));
+        return fnv1a(buf, o);
+    }
+
     bool try_load_cache(uint64_t params_hash) {
         if (cache_path.empty()) return false;
         FILE* f = fopen(cache_path.c_str(), "rb");
@@ -316,12 +397,21 @@ class SmartDecimateEOD : public GenericVideoFilter {
                   fread(&fd,sizeof(fd),1,f)==1 &&
                   fread(&ph,sizeof(ph),1,f)==1;
         if (!ok || magic != SDEC_MAGIC || ver != SDEC_VERSION ||
-            (int)n != N_in || ph != params_hash) { fclose(f); return false; }
+            (int)n != N_in || ph != params_hash) {
+            fprintf(stderr, "[SmartDecimateEOD] cache reject: ok=%d magic=%s ver=%u(want %u) "
+                    "n=%u(want %d) hash=%llu(want %llu)\n",
+                    (int)ok, (magic==SDEC_MAGIC?"ok":"BAD"), ver, SDEC_VERSION,
+                    n, N_in, (unsigned long long)ph, (unsigned long long)params_hash);
+            fflush(stderr);
+            fclose(f); return false;
+        }
         keep_mask.assign(n, 0);
         out_to_src.assign(t, 0);
         ok = fread(keep_mask.data(), 1, n, f) == n &&
              fread(out_to_src.data(), sizeof(int32_t), t, f) == t;
         if (!ok) { fclose(f); return false; }
+        out_boundary.assign(t, 0);
+        if (fread(out_boundary.data(), 1, t, f) != t) out_boundary.assign(t, 0);
         N_out = (int)t;
         fps_num_out = (int)fn;
         fps_den_out = (int)fd;
@@ -365,6 +455,16 @@ class SmartDecimateEOD : public GenericVideoFilter {
         return true;
     }
 
+    void build_out_boundary() {
+        out_boundary.assign(N_out, 0);
+        if (scene_of.empty()) return;
+        for (int j = 0; j < N_out; ++j) {
+            int sc_cur  = scene_of[out_to_src[j]];
+            int sc_prev = (j > 0) ? scene_of[out_to_src[j - 1]] : -1;
+            out_boundary[j] = (sc_cur != sc_prev) ? 1 : 0;
+        }
+    }
+
     void save_cache(uint64_t params_hash) const {
         if (cache_path.empty()) return;
         ensure_dir_for_file(cache_path.c_str());
@@ -382,6 +482,13 @@ class SmartDecimateEOD : public GenericVideoFilter {
         fwrite(&params_hash,sizeof(params_hash),1,f);
         fwrite(keep_mask.data(), 1, keep_mask.size(), f);
         fwrite(out_to_src.data(), sizeof(int32_t), out_to_src.size(), f);
+        // out_boundary: decimated-timeline scene cuts (size N_out)
+        if ((int)out_boundary.size() == N_out)
+            fwrite(out_boundary.data(), 1, N_out, f);
+        else {
+            std::vector<uint8_t> zero(N_out, 0);
+            fwrite(zero.data(), 1, N_out, f);
+        }
         // v2: diagnostic arrays for mark_only reuse
         if (!is_dup.empty()) {
             fwrite(is_dup.data(), 1, N_in, f);
@@ -414,6 +521,8 @@ public:
                      bool _protect_fade, bool _allow_cut,
                      const char* _cache, const char* _log, bool _debug,
                      bool _analyze_only, const char* _analyze_log,
+                     const char* _scuts_out,
+                     const char* _scenes_file,
                      IScriptEnvironment* env)
         : GenericVideoFilter(_child), sc_clip(_sc),
           fps_out(_fps_out),
@@ -428,7 +537,9 @@ public:
           protect_fade(_protect_fade), allow_original_cut(_allow_cut),
           debug(_debug), analyze_only(_analyze_only),
           cache_path(_cache ? _cache : ""), log_path(_log ? _log : ""),
-          analyze_log_path(_analyze_log ? _analyze_log : "")
+          analyze_log_path(_analyze_log ? _analyze_log : ""),
+          scuts_out_path(_scuts_out ? _scuts_out : ""),
+          scenes_file_path(_scenes_file ? _scenes_file : "")
     {
         if (!vi.IsYV12())
             env->ThrowError("SmartDecimateEOD: YV12 input required");
@@ -447,15 +558,12 @@ public:
         fps_num_out = (int)(fps_out * 1000.0 + 0.5);
         fps_den_out = 1000;
 
-        // Params hash
+        // Params hash. IMPORTANT: hash the fields explicitly, never the raw
+        // struct memory — a mixed double/int/uint8_t struct has padding bytes
+        // that are uninitialized, so hashing sizeof(struct) gives different
+        // results for identical field values (nondeterministic cache misses).
         int mode_id = (mode == "content") ? 1 : (mode == "mark_only" ? 2 : 0);
-        struct { double a,bp,rc,rm,tr; int b,c,d,e,f,tw,th_,rs; uint8_t g,h,i,j; } hk =
-            { fps_out, bypass_alt, residual_ceiling, residual_mult, th_ratio,
-              th_ssim_dup, (int)full_range, mode_id, fade_ratio, fade_mean_drift,
-              thumb_w, thumb_h, reg_scale,
-              (uint8_t)bypass_min_len, (uint8_t)bypass_window,
-              (uint8_t)(protect_fade?1:0), (uint8_t)(allow_original_cut?1:0) };
-        uint64_t params_hash = fnv1a(&hk, sizeof(hk));
+        uint64_t params_hash = params_hash_for(mode_id);
 
         if (analyze_only) {
             // Always re-run Pass 1.
@@ -467,13 +575,7 @@ public:
         } else if (mode == "mark_only") {
             // Try loading diagnostic arrays from cfr cache (mode_id=0).
             // This avoids a full preanalyze — mark_only becomes instant.
-            struct { double a,bp,rc,rm,tr; int b,c,d,e,f,tw,th_,rs; uint8_t g,h,i,j; } hk_cfr =
-                { fps_out, bypass_alt, residual_ceiling, residual_mult, th_ratio,
-                  th_ssim_dup, (int)full_range, 0 /*mode_id=cfr*/, fade_ratio, fade_mean_drift,
-                  thumb_w, thumb_h, reg_scale,
-                  (uint8_t)bypass_min_len, (uint8_t)bypass_window,
-                  (uint8_t)(protect_fade?1:0), (uint8_t)(allow_original_cut?1:0) };
-            uint64_t cfr_hash = fnv1a(&hk_cfr, sizeof(hk_cfr));
+            uint64_t cfr_hash = params_hash_for(0);
             if (try_load_cache(cfr_hash) && !is_dup.empty() && !d_alternation.empty()) {
                 // Diagnostics loaded from cfr cache — set up mark_only output.
                 N_out = N_in;
@@ -489,7 +591,13 @@ public:
             }
         } else if (try_load_cache(params_hash)) {
             // cfr mode, cache hit — all arrays loaded including diagnostics.
+            fprintf(stderr, "[SmartDecimateEOD] CACHE HIT: loaded from %s (N_in=%d N_out=%d)\n",
+                    cache_path.c_str(), N_in, N_out); fflush(stderr);
         } else {
+            fprintf(stderr, "[SmartDecimateEOD] CACHE MISS: recomputing Pass 1. "
+                    "cache='%s' N_in=%d hash=%llu mode=%s reg_scale=%d fps_out=%.3f\n",
+                    cache_path.c_str(), N_in, (unsigned long long)params_hash,
+                    mode.c_str(), reg_scale, fps_out); fflush(stderr);
             preanalyze(env);
             save_cache(params_hash);
         }
@@ -515,7 +623,9 @@ public:
         d_sceneStart.assign(N_in, 0);
         d_alternation.assign(N_in, 0.0);
 
-        // PASS 1A-FAST: SSIM on thumbnail + scene boundaries (all frames).
+        // ── Read scene boundaries + meanY from sc_clip. In READ mode
+        //    (scenes_file) this is zero pixel decode of child — only
+        //    frame-prop traffic on sc_clip. Cheap.
         std::vector<int>    ssim_val(N_in, 0);
         std::vector<double> resid(N_in, 0.0);
         std::vector<double> ratio_v(N_in, 1.0);
@@ -523,39 +633,53 @@ public:
         std::vector<int>    boundaries;
         boundaries.push_back(0);
 
-        int tn = thumb_w * thumb_h;
-        std::vector<uint8_t> thumb_prev(tn);
-        std::vector<uint8_t> thumb_cur(tn);
-
-        {
-            PVideoFrame f0 = child->GetFrame(0, env);
-            make_thumb(f0, thumb_prev.data(), full_range);
-        }
-
         bool has_meanY = false;
-        {
+        if (!scenes_file_path.empty()) {
+            // ── Direct read of scenes.txt (SCDetectEOD format): one integer
+            //    per line, optional "# ..." comment. Zero frame-prop traffic,
+            //    no sc_clip needed. meanY is not in the file, but it is computed
+            //    per-frame from thumbnails in Pass 1A below, so fade detection
+            //    still works in this mode.
+            FILE* f = fopen_utf8(scenes_file_path.c_str(), L"rb");
+            if (!f)
+                env->ThrowError("SmartDecimateEOD: cannot open scenes_file '%s'",
+                                scenes_file_path.c_str());
+            char line[512];
+            int last = 0;
+            while (fgets(line, sizeof(line), f)) {
+                char* p = line;
+                while (*p == ' ' || *p == '\t') ++p;
+                if (*p == '#' || *p == '\r' || *p == '\n' || *p == '\0') continue;
+                char* end = nullptr;
+                long v = strtol(p, &end, 10);
+                if (end == p) continue;            // no digits on this line
+                int b = (int)v;
+                if (b <= 0 || b >= N_in) continue; // 0 and out-of-range ignored
+                if (b <= last) continue;           // keep strictly ascending
+                boundaries.push_back(b);
+                last = b;
+            }
+            fclose(f);
+            // meanY stays all -1 (already initialized); has_meanY=false.
+        } else {
+            // ── Legacy: read scene boundaries + meanY from sc_clip frame-props.
+            //    In READ mode (SCDetectEOD reading a file) this is zero pixel
+            //    decode of child — only frame-prop traffic on sc_clip.
             PVideoFrame sf = sc_clip->GetFrame(0, env);
             auto props = env->getFramePropsRO(sf);
             int err = 0;
             meanY[0] = (int)env->propGetInt(props, "_scd_meanY", 0, &err);
-            if (err == 0) has_meanY = true;
-            else meanY[0] = -1;
-        }
-        for (int i = 1; i < N_in; ++i) {
-            PVideoFrame cur_f = child->GetFrame(i, env);
-            make_thumb(cur_f, thumb_cur.data(), full_range);
-            ssim_val[i] = compute_ssim(thumb_prev.data(), thumb_cur.data(), tn);
-            d_ssim[i] = ssim_val[i];
-            std::memcpy(thumb_prev.data(), thumb_cur.data(), tn);
-
-            PVideoFrame sf = sc_clip->GetFrame(i, env);
-            auto props = env->getFramePropsRO(sf);
-            int err = 0;
-            int b  = (int)env->propGetInt(props, "_scd_boundary", 0, &err);
-            int err2 = 0;
-            meanY[i] = (int)env->propGetInt(props, "_scd_meanY", 0, &err2);
-            if (err2 != 0) meanY[i] = -1;
-            if (b == 1) boundaries.push_back(i);
+            if (err == 0) has_meanY = true; else meanY[0] = -1;
+            for (int i = 1; i < N_in; ++i) {
+                PVideoFrame sf2 = sc_clip->GetFrame(i, env);
+                auto props2 = env->getFramePropsRO(sf2);
+                int e1 = 0;
+                int b = (int)env->propGetInt(props2, "_scd_boundary", 0, &e1);
+                int e2 = 0;
+                meanY[i] = (int)env->propGetInt(props2, "_scd_meanY", 0, &e2);
+                if (e2 != 0) meanY[i] = -1;
+                if (b == 1) boundaries.push_back(i);
+            }
         }
         boundaries.push_back(N_in);
 
@@ -565,7 +689,34 @@ public:
         is_fade_src.assign(N_in, 0);
         std::vector<uint8_t> is_fade(S, 0);
 
-        // PASS 1B: per-scene classification.
+        int tn = thumb_w * thumb_h;
+        std::vector<uint8_t> thumb_prev(tn), thumb_cur(tn);
+
+        // ── PASS 1A: SSIM sweep over ALL frames (cheap thumbnails), one
+        //    decode per frame.
+        int bw = rs_w(), bh = rs_h();
+        size_t bsz = (size_t)bw * bh;
+        {
+            PVideoFrame f0 = child->GetFrame(0, env);
+            make_thumb(f0, thumb_prev.data(), full_range);
+            if (!has_meanY) meanY[0] = thumb_mean(thumb_prev.data(), tn);
+        }
+        for (int i = 1; i < N_in; ++i) {
+            PVideoFrame cf = child->GetFrame(i, env);
+            make_thumb(cf, thumb_cur.data(), full_range);
+            if (!has_meanY) meanY[i] = thumb_mean(thumb_cur.data(), tn);
+            ssim_val[i] = compute_ssim(thumb_prev.data(), thumb_cur.data(), tn);
+            d_ssim[i] = ssim_val[i];
+            std::memcpy(thumb_prev.data(), thumb_cur.data(), tn);
+        }
+        // scenes_file mode: meanY is now filled per-frame from thumbnails, so
+        // fade detection can run. (sc_clip mode already set has_meanY above.)
+        if (!scenes_file_path.empty()) has_meanY = true;
+
+        // ── PASS 1B: per-scene. Fade + SSIM guard are cheap (use ssim_val).
+        //    Registration runs ONLY for scenes that pass the guard (deferred);
+        //    guard-rejected scenes (static / on-ones / fast motion / fades)
+        //    skip it. This deferral is what keeps Pass 1 fast on mixed material.
         for (int s = 0; s < S; ++s) {
             int a = boundaries[s];
             int b = boundaries[s + 1];
@@ -578,12 +729,11 @@ public:
             if (len < 2) continue;
 
             // Fade detection: monotonic meanY drift with sufficient magnitude.
-            // Disabled automatically when SCDetectEOD v2 runs in READ mode
-            // (no _scd_meanY prop available).
+            // meanY is per-frame in both modes: from sc_clip props, or computed
+            // from thumbnails in scenes_file mode (Pass 1A above).
             if (protect_fade && has_meanY) {
                 int drift = std::abs(meanY[b - 1] - meanY[a]);
                 if (drift >= fade_mean_drift) {
-                    // Check monotonicity (allow small jitter)
                     int sign = (meanY[b - 1] > meanY[a]) ? 1 : -1;
                     int violations = 0;
                     for (int i = a + 1; i < b; ++i) {
@@ -598,16 +748,7 @@ public:
                 }
             }
 
-            // HYBRID classification: SSIM guard + registration+SAD+ratio.
-            //
-            // Step 1: SSIM guard on thumbnail — if q80(ssim) < th_ssim_dup,
-            //         scene has no real dups (all frames differ structurally).
-            //         Skip expensive registration → all ORIG.
-            // Step 2: For scenes that pass the guard, use registration+SAD
-            //         with percentile threshold + block ratio (AND logic)
-            //         for accurate per-frame dup/orig classification.
-
-            // SSIM guard
+            // SSIM guard: if q80(ssim) < th_ssim_dup, scene has no real dups.
             std::vector<int> ss;
             ss.reserve(len - 1);
             for (int i = a + 1; i < b; ++i) ss.push_back(ssim_val[i]);
@@ -616,7 +757,6 @@ public:
             int q80_idx = (int)(ss_sorted.size() * 0.80);
             if (q80_idx >= (int)ss_sorted.size()) q80_idx = (int)ss_sorted.size() - 1;
             int q80 = ss_sorted[q80_idx];
-
             if (q80 < th_ssim_dup) {
                 for (int i = a; i < b; ++i) {
                     d_otsu[i] = (double)th_ssim_dup;
@@ -625,34 +765,33 @@ public:
                 continue; // all ORIG — SSIM says no dups, skip registration
             }
 
-            // PASS 1B-SLOW: compute registration+SAD only for this scene
-            // (skipped entirely for scenes rejected by SSIM guard above).
+            // Deferred registration: only guard-passing scenes reach here.
+            // Rolling 2-frame downscaled buffer; grid search on the small buffer.
+            std::vector<uint8_t> buf_prev(bsz), buf_cur(bsz);
             {
                 PVideoFrame pf = child->GetFrame(a, env);
-                for (int i = a + 1; i < b; ++i) {
-                    PVideoFrame cf = child->GetFrame(i, env);
-                    double r, rt;
-                    compute_pair(pf, cf, r, rt);
-                    resid[i] = r;
-                    ratio_v[i] = rt;
-                    d_residual[i] = r;
-                    d_ratio[i] = rt;
-                    pf = cf;
-                }
+                downscale_into(pf, buf_prev.data());
+            }
+            for (int i = a + 1; i < b; ++i) {
+                PVideoFrame cf = child->GetFrame(i, env);
+                downscale_into(cf, buf_cur.data());
+                double r, rt;
+                compute_pair_buf(buf_prev.data(), buf_cur.data(), r, rt);
+                resid[i] = r; ratio_v[i] = rt;
+                d_residual[i] = r; d_ratio[i] = rt;
+                buf_prev.swap(buf_cur);
             }
 
-            // Registration-based classification
+            // Residual percentile classification.
             std::vector<double> sd;
             sd.reserve(len - 1);
             for (int i = a + 1; i < b; ++i) sd.push_back(resid[i]);
-
             std::vector<double> sd_sorted = sd;
             std::sort(sd_sorted.begin(), sd_sorted.end());
             int q_idx = (int)(sd_sorted.size() * 0.20);
             if (q_idx < 0) q_idx = 0;
             if (q_idx >= (int)sd_sorted.size()) q_idx = (int)sd_sorted.size() - 1;
             double q_low = sd_sorted[q_idx];
-
             if (q_low > residual_ceiling) {
                 for (int i = a; i < b; ++i) {
                     d_otsu[i] = q_low;
@@ -660,11 +799,9 @@ public:
                 }
                 continue; // all ORIG — residual too high for dups
             }
-
             double thr_res = q_low * residual_mult;
             if (thr_res < 1.0) thr_res = 1.0;
             for (int i = a; i < b; ++i) d_otsu[i] = thr_res;
-
             for (int i = a + 1; i < b; ++i) {
                 bool sig1 = resid[i] < thr_res;
                 bool sig2 = ratio_v[i] < th_ratio;
@@ -827,6 +964,27 @@ public:
             N_out = kept;
             fps_num_out = (int)(fps_out * 1000.0 + 0.5);
             fps_den_out = 1000;
+
+            // Materialize decimated-timeline scene boundaries from the verified
+            // scuts.txt scenes (via scene_of) remapped through out_to_src.
+            // Output frame j is a boundary if its source scene differs from the
+            // previous kept frame's source scene. This is the exact remap of the
+            // hand-verified cuts onto the decimated clip — no re-detection.
+            build_out_boundary();
+
+            // Write decimated-timeline scene cuts as a scenes.txt for
+            // SCSignalBorder (or any scenes_file consumer) on the decimated
+            // clip. These are the hand-verified scuts.txt cuts remapped — no
+            // re-detection on the decimated picture.
+            if (!scuts_out_path.empty()) {
+                ensure_dir_for_file(scuts_out_path.c_str());
+                FILE* sf = fopen(scuts_out_path.c_str(), "w");
+                if (sf) {
+                    for (int j = 1; j < N_out; ++j)
+                        if (out_boundary[j]) fprintf(sf, "%d\n", j);
+                    fclose(sf);
+                }
+            }
 
             if (!log_path.empty()) {
                     ensure_dir_for_file(log_path.c_str());
@@ -1045,6 +1203,16 @@ public:
         if (n >= N_out) n = N_out - 1;
         int src_n = out_to_src[n];
         PVideoFrame f = child->GetFrame(src_n, env);
+
+        // Emit _scd_boundary on the decimated timeline from the materialized
+        // out_boundary array (verified scuts.txt cuts remapped through
+        // out_to_src in Pass 1). No second SCDetectEOD, no re-detection.
+        if ((mode != "mark_only") && (int)out_boundary.size() == N_out) {
+            env->MakeWritable(&f);
+            auto props = env->getFramePropsRW(f);
+            env->propSetInt(props, "_scd_boundary", out_boundary[n], 0);
+        }
+
         if (debug || analyze_only || mode == "mark_only") {
             env->MakeWritable(&f);
             auto props = env->getFramePropsRW(f);
@@ -1091,9 +1259,14 @@ public:
     }
 
     static AVSValue __cdecl Create(AVSValue args, void*, IScriptEnvironment* env) {
+        PClip sc = args[1].IsClip() ? args[1].AsClip() : nullptr;
+        const char* scenes_file = args[25].AsString("");
+        if (!sc && (!scenes_file || !*scenes_file))
+            env->ThrowError("SmartDecimateEOD: need either sc clip (2nd arg) "
+                            "or scenes_file=");
         return new SmartDecimateEOD(
             args[0].AsClip(),
-            args[1].AsClip(),
+            sc,
             args[2].AsFloat(12.5f),      // fps_out
             args[3].AsInt(990),          // th_ssim_dup (SSIM guard)
             args[4].AsFloat(5.0f),       // residual_ceiling
@@ -1116,6 +1289,8 @@ public:
             args[21].AsBool(false),      // debug
             args[22].AsBool(false),      // analyze_only
             args[23].AsString(""),       // analyze_log
+            args[24].AsString(""),       // scuts_out
+            scenes_file,                 // scenes_file (direct boundary source)
             env);
     }
 };
@@ -1126,12 +1301,12 @@ extern "C" __declspec(dllexport)
 const char* __stdcall AvisynthPluginInit3(IScriptEnvironment* env, const AVS_Linkage* const vectors) {
     AVS_linkage = vectors;
     env->AddFunction("SmartDecimateEOD",
-        "cc[fps_out]f[th_ssim_dup]i[residual_ceiling]f[residual_mult]f[th_ratio]f"
+        "c[sc]c[fps_out]f[th_ssim_dup]i[residual_ceiling]f[residual_mult]f[th_ratio]f"
         "[reg_scale]i[full_range]b[thumb_w]i[thumb_h]i"
         "[bypass_alt]f[bypass_min_len]i[bypass_window]i[mode]s"
         "[fade_ratio]i[fade_mean_drift]i"
         "[protect_fade]b[allow_original_cut]b[cache]s[log]s[debug]b"
-        "[analyze_only]b[analyze_log]s",
+        "[analyze_only]b[analyze_log]s[scuts_out]s[scenes_file]s",
         SmartDecimateEOD::Create, nullptr);
-    return "SmartDecimateEOD v5.4 — shared cache between cfr and mark_only";
+    return "SmartDecimateEOD v6.0 — direct scenes_file read (sc optional, fade detection via thumbnail meanY)";
 }
